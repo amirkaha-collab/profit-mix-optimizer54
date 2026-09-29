@@ -1,0 +1,77 @@
+import {EconomicPathLedger,LotLedger} from '../src/ledgers.js';
+import {ScenarioValuator} from '../src/events.js';
+import {CoreBlocked,iso,years} from '../src/schema.js';
+import {validateContinuationValueResult} from '../src/continuation.js';
+const EPS=1e-8;
+const fail=m=>{throw new CoreBlocked(m)};
+const freeze=x=>{if(x&&typeof x==='object'&&!Object.isFrozen(x)){for(const v of Object.values(x))freeze(v);Object.freeze(x)}return x};
+const money=(n,k)=>{if(typeof n!=='number'||!Number.isFinite(n)||n<0)fail(`missing/invalid ${k}`);return n};
+const unique=a=>new Set(a).size===a.length;
+const SHA=/^[a-f0-9]{64}$/i;
+const forbidden=/WORKING_QA|SYNTHETIC_TEST_ONLY|LEGACY_COMPATIBILITY/;
+const noForbidden=(v,path='root')=>{if(typeof v==='string'&&forbidden.test(v))fail(`controlled residual forbidden evidence at ${path}`);if(v&&typeof v==='object')for(const [k,x] of Object.entries(v))noForbidden(x,`${path}.${k}`)};
+
+function normalizeCommon(raw,{mode,controlled=false}={}){
+ const continuationAdapter=raw?.continuationAdapter??null,copy={...raw};delete copy.continuationAdapter;const d=structuredClone(copy);d.continuationAdapter=continuationAdapter;
+ if(d.schemaVersion!==(controlled?'F8_CONTROLLED_LIVE_RESIDUAL_V1':'F8_LIVE_RESIDUAL_V1')||d.mode!==mode||!Array.isArray(d.originLots)||!d.originLots.length||!Array.isArray(d.scenarios)||!d.scenarios.length)fail('personal residual contracts required');
+ iso(d.valuationStartDate);if(typeof d.annualNominalReturn!=='number'||!Number.isFinite(d.annualNominalReturn)||d.annualNominalReturn<=-1)fail('missing/invalid nominal return');money(d.annualInflation,'inflation');if(d.annualNominalReturn>=10||d.annualInflation>=10)fail('unsupported annual assumption');
+ if(!unique(d.originLots.map(x=>x.id))||!unique(d.originLots.map(x=>x.economicPathId)))fail('duplicate origin identity');
+ for(const l of d.originLots){if(!l.id||!l.economicPathId||!l.sourceEventId||!['savings_policy','t190','taxable','cash'].includes(l.wrapper)||l.owner!=='member')fail('owned origin lot required');iso(l.availabilityDate);if(l.availabilityDate>d.valuationStartDate)fail('future origin cannot be opening capital');money(l.amount,'origin amount');if(l.amount<=0)fail('omit empty origin');money(l.taxBasisNominal,'nominal basis');money(l.taxBasisReal,'indexed basis');money(l.annualFee,'product fee');if(l.annualFee>=1)fail('invalid product fee');if(!['indexed','nominal','exempt'].includes(l.taxTreatment?.basis)||l.taxTreatment.basis==='exempt'&&l.taxTreatment.rate!==0)fail('tax treatment missing');money(l.taxTreatment.rate,'tax rate');if(l.taxTreatment.rate>1)fail('tax rate outside bounds');
+  if(controlled){if(!l.productId||!l.providerId||l.productionVerified!==true||l.classificationStatus!=='VERIFIED'||!l.taxTreatment?.ruleId||l.taxTreatment.productionVerified!==true||!Array.isArray(l.evidenceReferences)||!l.evidenceReferences.length)fail('verified residual source/tax provenance required');}
+ }
+ let w=0;for(const s of d.scenarios){if(!s.id)fail('scenario ID required');const kind=s.kind??'MEMBER_DEATH',end=kind==='SURVIVE_TO_TERMINAL_HORIZON'?s.terminalDate:s.memberDeathDate;if(!['MEMBER_DEATH','SURVIVE_TO_TERMINAL_HORIZON'].includes(kind))fail('explicit residual scenario kind required');iso(end);if(end<d.valuationStartDate)fail('scenario ends before valuation');money(s.weight,'probability');money(s.discountRate,'discount rate');w+=s.weight}if(!unique(d.scenarios.map(s=>s.id))||Math.abs(w-1)>1e-8)fail('ex-ante distribution invalid');
+ for(const k of ['memberDeathAge','spouseDeathAge','disabilityAge','deathSlider'])if(Object.hasOwn(d,k))fail('scenario sensitivity cannot enter plan');
+ return d;
+}
+export function normalizeResidualInput(raw){
+ const d=normalizeCommon(raw,{mode:'WORKING_QA'});
+ if(d.provenance?.source!=='LEGACY_COMPATIBILITY'||d.provenance.productionVerified!==false||d.provenance.useScope!=='WORKING_QA')fail('provisional rule provenance required');
+ return freeze(d);
+}
+function normalizeControlledResidualInput(raw,authority){
+ const d=normalizeCommon(raw,{mode:'CONTROLLED_LIVE',controlled:true});
+ if(authority?.schemaVersion!=='F8_CONTROLLED_LIVE_RESIDUAL_AUTHORITY_V1'||authority.productionVerified!==true||!SHA.test(authority.runtimeEnvelopeHash??'')||!SHA.test(authority.casePackHash??'')||!Array.isArray(authority.sourceReferences)||!authority.sourceReferences.length)fail('strict controlled residual authority required');
+ noForbidden(authority);noForbidden(d);
+ if(d.provenance?.productionVerified!==true||d.provenance?.runtimeEnvelopeHash!==authority.runtimeEnvelopeHash||d.provenance?.casePackHash!==authority.casePackHash)fail('controlled residual input not bound to verified runtime/case');
+ const allowed=new Set(authority.sourceReferences);for(const r of d.provenance?.sourceReferences??[])if(!allowed.has(r))fail('controlled residual provenance reference outside authority');
+ for(const l of d.originLots)for(const r of l.evidenceReferences)if(!allowed.has(r))fail('controlled residual source reference outside authority');if(d.continuationAdapter){const a=d.continuationAdapter;if(a.productionVerified!==true||a.controlledLiveVerified!==true||a.runtimeEnvelopeHash!==authority.runtimeEnvelopeHash||a.casePackHash!==authority.casePackHash||typeof a.valueContinuation!=='function')fail('verified residual continuation adapter required');noForbidden(a)}
+ return freeze(d);
+}
+
+function normalizeProfessionalSimulationBetaResidualInput(raw,authority){
+ const d=normalizeCommon(raw,{mode:'PROFESSIONAL_SIMULATION_BETA'});
+ if(authority?.schemaVersion!=='F8_BETA_RESIDUAL_AUTHORITY_V1'||authority.simulationAuthorized!==true||authority.productionVerified!==false||!SHA.test(authority.assumptionPackHash??'')||!authority.caseId)fail('strict professional simulation beta residual authority required');
+ if(d.provenance?.simulationMode!=='PROFESSIONAL_SIMULATION_BETA'||d.provenance?.assumptionPackHash!==authority.assumptionPackHash||d.provenance?.productionVerified!==false)fail('beta residual input not bound to assumption pack');
+ return freeze(d);
+}
+function lotMeta(input,origin){if(input.mode==='CONTROLLED_LIVE')return {providerId:origin.providerId,classificationStatus:'VERIFIED',deathRuleId:origin.deathRuleId??origin.taxTreatment.ruleId,withdrawalRuleId:origin.withdrawalRuleId??origin.taxTreatment.ruleId,feeScheduleId:origin.feeScheduleId??`verified-fee:${origin.productId}`};if(input.mode==='PROFESSIONAL_SIMULATION_BETA')return {providerId:origin.providerId??'BETA_PROVIDER',classificationStatus:'BETA_ASSUMPTION',deathRuleId:origin.deathRuleId??origin.taxTreatment.ruleId??'BETA_ASSUMPTION',withdrawalRuleId:origin.withdrawalRuleId??origin.taxTreatment.ruleId??'BETA_ASSUMPTION',feeScheduleId:origin.feeScheduleId??`beta-fee:${origin.productId??origin.id}`};return {providerId:'LEGACY_COMPATIBILITY',classificationStatus:'WORKING_QA',deathRuleId:'LEGACY_COMPATIBILITY',withdrawalRuleId:'LEGACY_COMPATIBILITY',feeScheduleId:'LEGACY_COMPATIBILITY'}}
+function scenarioState(input,scenario){
+ const kind=scenario.kind??'MEMBER_DEATH',terminal=kind==='SURVIVE_TO_TERMINAL_HORIZON',endDate=terminal?scenario.terminalDate:scenario.memberDeathDate;
+ const paths=new EconomicPathLedger(),lots=new LotLedger(paths),rows=[],balances=[],taxes=[],fees=[];let serial=0;
+ const id=(kind,lot)=>`f8live:${scenario.id}:${serial++}:${kind}:${lot}`;const liveAccounts=new Map();
+ const child=(account,amount,kind)=>paths.open(id(kind,account.lotId),amount,{parentPathId:account.pathId,currentOwner:'member',sourceEventId:id(`${kind}:event`,account.lotId)});
+ const take=(accounts,amount,kind,date)=>{let left=amount;for(const a of accounts){if(left<=EPS)break;const used=Math.min(a.amount,left);if(used<=EPS)continue;const original=a.amount;if(used<original-EPS){const retained=child(a,original-used,'retained');const consumed=child(a,used,kind);a.pathId=retained.id;a.amount=retained.amount;paths.sink(consumed.id,id(kind,a.lotId),kind,date,used)}else{paths.sink(a.pathId,id(kind,a.lotId),kind,date,used);a.amount=0}left-=used}if(left>1e-6)fail('unfunded economic cost')};
+ for(const origin of input.originLots){const path=paths.open(origin.economicPathId,origin.amount,{currentOwner:'member',currentLotId:origin.id,sourceEventId:origin.sourceEventId}),m=lotMeta(input,origin);lots.add({id:origin.id,owner:'member',wrapper:origin.wrapper,providerId:m.providerId,sourceType:'fresh_contribution',contributionDate:origin.availabilityDate,originalPrincipal:origin.amount,currentValue:origin.amount,taxBasisNominal:origin.taxBasisNominal,taxBasisReal:origin.taxBasisReal,taxClass:origin.wrapper==='t190'?'recognized':'other',classificationStatus:m.classificationStatus,deathRuleId:m.deathRuleId,withdrawalRuleId:m.withdrawalRuleId,feeScheduleId:m.feeScheduleId,liquidityClass:'residual',economicPathId:path.id});const available=lots.release(origin.id,id('released',origin.id),'residual_opening');liveAccounts.set(origin.id,[{lotId:origin.id,pathId:available.id,amount:origin.amount}])}
+ let previous=input.valuationStartDate;const dates=[];for(let y=Number(previous.slice(0,4))+1;y<=Number(endDate.slice(0,4));y++){const d=`${y}-01-01`;if(d<endDate)dates.push(d)}if(dates.at(-1)!==endDate)dates.push(endDate);
+ for(const date of dates){const dt=years(previous,date),byProduct={};for(const origin of input.originLots){const accounts=liveAccounts.get(origin.id),opening=accounts.reduce((n,a)=>n+a.amount,0),grossGain=opening*(Math.pow(1+input.annualNominalReturn,dt)-1);if(grossGain>EPS){const gain=paths.open(id('market_gain',origin.id),grossGain,{currentOwner:'member',sourceEventId:`market_return:${origin.id}:${date}`});accounts.push({lotId:origin.id,pathId:gain.id,amount:grossGain})}else if(grossGain< -EPS){take(accounts,-grossGain,'market_loss',date)}const fee=(opening+grossGain)*(1-Math.pow(1-origin.annualFee,dt));if(fee>EPS){take(accounts,fee,'management_fee',date);fees.push({originLotId:origin.id,amount:fee,date})}const closing=accounts.reduce((n,a)=>n+a.amount,0);byProduct[origin.id]={opening,grossReturn:grossGain,fee,closing,wrapper:origin.wrapper,pathIds:accounts.filter(a=>a.amount>EPS).map(a=>a.pathId)}}rows.push({date,byProduct});previous=date}
+ let valuation,continuation=null;
+ if(terminal){const livePaths=[];for(const origin of input.originLots){const accounts=liveAccounts.get(origin.id),gross=accounts.reduce((n,a)=>n+a.amount,0);for(const a of accounts)if(a.amount>EPS)livePaths.push({id:a.pathId,amount:a.amount,owner:'member',category:'residual_continuation',rightId:null});rows.at(-1).byProduct[origin.id].closingNet=gross;balances.push({originLotId:origin.id,gross,net:gross,basisNominal:origin.taxBasisNominal,basisReal:origin.taxBasisReal,tax:0,wrapper:origin.wrapper,originPathId:origin.economicPathId})}const a=input.continuationAdapter;if(!a||typeof a.valueContinuation!=='function')fail('residual terminal continuation adapter required');const raw=a.valueContinuation({kind:'RESIDUAL_MEMBER_ALIVE_TERMINAL',valuationDate:endDate,state:{livePaths,rights:[],scenario,remainingPlannedObligations:[]}});continuation=validateContinuationValueResult(raw,{valuationDate:endDate,mode:input.mode,livePaths,rightIds:[]});valuation=freeze({valuationDate:endDate,total:continuation.continuationValue,components:freeze(continuation.components.map(c=>freeze({id:c.id,pathId:c.backingPathIds[0]??null,recipient:'family',date:endDate,amountNet:c.value,category:c.category,valuationDate:endDate,pvAtMemberDeath:c.value})))})}
+ else{for(const origin of input.originLots){const accounts=liveAccounts.get(origin.id),gross=accounts.reduce((n,a)=>n+a.amount,0),duration=years(input.valuationStartDate,scenario.memberDeathDate),basis=origin.taxTreatment.basis==='indexed'?origin.taxBasisReal*Math.pow(1+input.annualInflation,duration):origin.taxTreatment.basis==='nominal'?origin.taxBasisNominal:Infinity,tax=origin.taxTreatment.basis==='exempt'?0:Math.min(gross,origin.taxTreatment.rate*Math.max(0,gross-basis));if(tax>EPS){take(accounts,tax,'realization_tax',scenario.memberDeathDate);taxes.push({originLotId:origin.id,amount:tax,date:scenario.memberDeathDate,basisUsed:basis})}for(const a of accounts)if(a.amount>EPS){paths.finalize(a.pathId,id('inherit',origin.id),'heirs',scenario.memberDeathDate,a.amount,'residual_inheritance',scenario.memberDeathDate)}rows.at(-1).byProduct[origin.id].terminalTax=tax;rows.at(-1).byProduct[origin.id].closingNet=gross-tax;balances.push({originLotId:origin.id,gross,net:gross-tax,basisNominal:origin.taxBasisNominal,basisReal:origin.taxBasisReal,tax,wrapper:origin.wrapper,originPathId:origin.economicPathId})}valuation=new ScenarioValuator().value(paths.finalUses(),scenario.memberDeathDate,scenario.discountRate)}
+ const reconciliation=paths.reconcile(lots);if(Math.abs(reconciliation.gap)>EPS||(!terminal&&reconciliation.liveTotal>EPS))throw new Error('residual root-to-leaf reconciliation');if(terminal&&Math.abs(reconciliation.liveTotal-(continuation?.components??[]).flatMap(c=>c.backingPathIds).map(id=>paths.get(id)?.amount??0).reduce((n,x)=>n+x,0))>1e-6)throw new Error('residual terminal continuation backing mismatch');const finalUses=paths.finalUses();return freeze({scenarioId:scenario.id,...(terminal?{kind,terminalDate:endDate}:{memberDeathDate:scenario.memberDeathDate}),weight:scenario.weight,valuation,finalUses,sinks:paths.sinks(),reconciliation,yearlyBalances:rows,balances,taxes,fees,rootPaths:reconciliation.roots,...(continuation?{terminalContinuation:continuation}:{})})
+}
+function planCore(input,{productionReady=false}={}){const planned=input.scenarios.map(s=>scenarioState(input,s)),baselineWithoutPlanning=input.scenarios.map(s=>scenarioState(input,{...s,id:`baseline_${s.id}`})),expectedFamilyValue=planned.reduce((n,s)=>n+s.weight*s.valuation.total,0);return freeze({schemaVersion:'F8_LIVE_PLAN_V1',mode:input.mode,strategy:'RESIDUAL_ONLY',rotation:{R:0,available:false},qualifying:{Q:0,available:false},long:{q:0,available:false},expectedFamilyValue,baselineWithoutPlanning,planned,originLots:input.originLots,exAnteScenarioIds:input.scenarios.map(s=>s.id),provenance:input.provenance,productionReady})}
+/** Safe feasible F8 policy: identity allocation for every owned origin. All optional policies compete against it. */
+export class F8LiveResidualPlanner{
+ plan(raw){return planCore(normalizeResidualInput(raw),{productionReady:false})}
+ evaluateBaselineSensitivity(raw,deathDate){const input=normalizeResidualInput(raw);iso(deathDate);return scenarioState(input,{id:'baseline_display',weight:1,memberDeathDate:deathDate,discountRate:0})}
+ evaluateSensitivity(raw,deathDate){const input=normalizeResidualInput(raw);iso(deathDate);const s={id:'display',weight:1,memberDeathDate:deathDate,discountRate:0};return scenarioState(input,s)}
+}
+/** Native verified entrypoint. Authorization differs; economic scenarioState/planCore are shared with QA. */
+export class F8ControlledLiveResidualPlanner{
+ plan(raw,authority){return planCore(normalizeControlledResidualInput(raw,authority),{productionReady:true})}
+}
+
+/** Professional Simulation Beta entrypoint. Authorization metadata differs; scenarioState/planCore remain shared. */
+export class F8ProfessionalSimulationBetaResidualPlanner{
+ plan(raw,authority){return planCore(normalizeProfessionalSimulationBetaResidualInput(raw,authority),{productionReady:false})}
+}
