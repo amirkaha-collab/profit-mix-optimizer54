@@ -1,0 +1,25 @@
+{
+  "candidate": "C2",
+  "chunks": 14,
+  "payloadBase64Chars": 1926760,
+  "sourceHtmlBytes": 5861768,
+  "modules": [
+    "F8_CORE/live/residual.js",
+    "F8_CORE/src/continuation.js",
+    "F8_CORE/src/events.js",
+    "F8_CORE/src/ledgers.js",
+    "F8_CORE/src/schema.js",
+    "integration/f8-browser-bridge.js",
+    "integration/f8-browser-live.js",
+    "integration/f8-canonical-snapshot.js",
+    "integration/f8-live-contracts.js",
+    "integration/f8-projection.js",
+    "u1/f8-binding.js",
+    "u1/f8-inheritance-lifecycle.js",
+    "u1/f8-inheritance-renderer-v2.js",
+    "u1/f8-projection-adapters.js",
+    "u1/f8-stable-hash.js",
+    "u1/f8-u1d-presentation.js",
+    "ui/f8-u1d-browser-entry.js"
+  ]
+}
